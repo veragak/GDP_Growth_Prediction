@@ -1,0 +1,365 @@
+---
+title: "GDP growth Prediction with OLS & Penalised Regression"
+author: |
+  | Daphne, Riya, Vera, Zsofi
+date: "September 29, 2025"
+output:
+  pdf_document: 
+    latex_engine: xelatex
+  html_document:
+    df_print: paged
+  word_document: default
+header-includes:
+- \usepackage{booktabs}
+- \usepackage{makecell}
+subtitle: "FEM11149 - Introduction to Data Science"
+editor_options:
+  chunk_output_type: inline
+urlcolor: blue
+linkcolor: red
+---
+
+```{r, echo = FALSE, eval = FALSE, warning = FALSE, message = FALSE}
+# Directory setup
+#path = dirname(rstudioapi::getSourceEditorContext()$"Desktop/Intro to DS/Assignment1") # Path is directory of this file
+#setwd("~/Desktop/Intro to DS/Assignment1")                                              # Set working directory
+```
+
+```{r, include = FALSE}
+### this all runs but doesn't show output or the code in the pdf 
+# Load libraries
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(glmnet)
+library(MASS)
+library(car)
+library(Metrics)
+library(pROC)
+library(corrplot)
+library(tinytex)
+
+# Load data
+df <- read.csv2("a1_data_group_22.csv", sep = ",") %>%
+  rename(gdp_growth_annual = GDP.growth..annual...,
+    net_trade_bop_usd = Net.trade.in.goods.and.services..BoP..current.US.. ) %>%
+  na.omit() %>% mutate(across(2:74, as.numeric), Country = as.factor(Country))
+
+# Clean column names
+names(df) <- make.names(names(df))
+
+#stepwise backward selection 
+base_model <- lm(gdp_growth_annual ~ . - Country, data = df)
+step_model <- stepAIC(base_model, direction = "backward")
+final_formula <- update(formula(step_model), . ~ . + net_trade_bop_usd)
+
+#OLS MODEL 
+reg_final <- lm(final_formula, data = df, singular.ok = FALSE)
+summary(reg_final)
+
+#NON-LINEAR VARIABLE MODEL: Squared fertility
+df <- df %>% mutate(fertility_sq = Fertility.rate..total..births.per.woman.^2)
+nonlinear_formula <- update(formula(step_model), . ~ . + fertility_sq +
+                              net_trade_bop_usd) 
+reg_nonlinear <- lm(nonlinear_formula, data = df, singular.ok = FALSE) #Fit the model
+summary(reg_nonlinear)
+
+#LASSO MODEL with same vars as OLS model 
+X <- model.matrix(nonlinear_formula, data = df)[, -1]
+y <- df$gdp_growth_annual
+
+set.seed(100) #set seed for consistent results
+lasso_cv <- cv.glmnet(X, y, alpha = 1, maxit = 1e6)
+plot(lasso_cv)
+coef(lasso_cv, s = "lambda.min")
+
+#TESTING AND TRAINING SPLIT
+set.seed(100)
+train_idx <- sample(1:nrow(df), 110)
+train_df <- df[train_idx, ]
+test_df <- df[-train_idx, ]
+
+X_train <- model.matrix(gdp_growth_annual ~ . - Country - fertility_sq, data = train_df)[, -1]
+y_train <- train_df$gdp_growth_annual
+X_test  <- model.matrix(gdp_growth_annual ~ . - Country - fertility_sq, data = test_df)[, -1]
+y_test  <- test_df$gdp_growth_annual
+
+#CROSS VALIDATION
+fitControl <- trainControl(method="repeatedcv", number=10, repeats=5)
+
+#RIDGE REG MODEL
+ridge_model <- train(x=X_train, y=y_train, method="glmnet",
+  tuneGrid=expand.grid(alpha=0, lambda=seq(0.0001, 1000, length=100)),
+  trControl=fitControl, preProcess=c("center", "scale"))
+
+#ELASTIC NET REG MODEL
+elastic_model <- train(x=X_train, y=y_train,method="glmnet",
+  tuneGrid=expand.grid(alpha=seq(0,1,length=10), lambda=seq(0.0001, 1000, length=50)),
+  trControl=fitControl, preProcess=c("center", "scale"))
+
+#RESULT COMPARISION: RMSE
+res <- resamples(list(Ridge=ridge_model, ElasticNet=elastic_model))
+summary(res)
+xyplot(res, metric="RMSE")
+
+#Ridge using cv.glmnet to get lambda.min and lambda.1se
+set.seed(100)
+r_cv <- cv.glmnet(x = X_train, y = y_train, alpha = 0, #Ridge
+  lambda = 10^seq(-3, 5, length.out = 100),  #Search over a wide range of lambdas
+  nfolds = 10) #10-fold cross-validation
+
+r_min_model <- glmnet(X_train, y_train, alpha = 0, lambda = r_cv$lambda.min)#Fit Ridge at lambda.min
+r_1se_model <- glmnet(X_train, y_train, alpha = 0, lambda = r_cv$lambda.1se)#Fit Ridge at lambda.1se
+
+best_alpha <- elastic_model$bestTune$alpha #best alpha from caret Elastic Net model
+
+#Elastic Net using cv.glmnet with optimal alpha
+set.seed(100)
+en_cv <- cv.glmnet(x = X_train,y = y_train, alpha = best_alpha,# Optimal mix between Lasso and Ridge
+  lambda = 10^seq(-3, 5, length.out = 100),nfolds = 10)
+
+#Fit Elastic Net at lambda.min and lambda.1se
+en_min_model <- glmnet(X_train, y_train, alpha = best_alpha, lambda = en_cv$lambda.min) #Fit EN at lambda.min
+en_1se_model <- glmnet(X_train, y_train, alpha = best_alpha, lambda = en_cv$lambda.1se)#Fit EN at lambda.min
+
+#Predictions and Performance #####
+r_min_pred <- predict(r_min_model, newx = X_test) # Ridge $λ$min
+ridge_1se_pred <- predict(r_1se_model, newx = X_test) # Ridge $λ$1se
+en_min_pred <- predict(en_min_model, newx = X_test) # Elastic Net $λ$min
+en_1se_pred <- predict(en_1se_model, newx = X_test) # Elastic Net $λ$1se
+
+#table
+compare_results <- data.frame(
+  Model = c("Ridge $λ$.min", "Ridge .1se", "ElasticNet $λ$.min", "ElasticNet $λ$.1se"),
+  lambda = c(r_cv$lambda.min, r_cv$lambda.1se, en_cv$lambda.min, en_cv$lambda.1se), 
+  alpha = c(0, 0, best_alpha, best_alpha),
+  RMSE  = c(rmse(y_test, r_min_pred), rmse(y_test, ridge_1se_pred), rmse(y_test, en_min_pred), rmse(y_test, en_1se_pred)))
+  knitr::kable(compare_results, caption = "Performance Comparison")
+
+
+#Logistic Model: dependent variable
+df <- df %>% mutate(growing_more = factor(ifelse(gdp_growth_annual > 2.7, 1, 0)))
+
+# Train-test split USING LOG MODEL 
+set.seed(1)
+log_train_idx <- sample(1:nrow(df), 110)
+train_log <- df[log_train_idx, ]
+test_log  <- df[-log_train_idx, ]
+
+x_train_log <- model.matrix(growing_more ~ . - Country - gdp_growth_annual, 
+                            data = train_log)[, -1]
+y_train_log <- train_log$growing_more
+x_test_log  <- model.matrix(growing_more ~ . - Country - gdp_growth_annual, 
+                            data = test_log)[, -1]
+y_test_log  <- test_log$growing_more
+
+cv_ridge_log <- cv.glmnet(x_train_log, y_train_log, family="binomial", alpha=0, nfolds=10)
+
+# ROC & AUC
+pred_prob <- predict(cv_ridge_log, newx=x_test_log, s="lambda.min", type="response")
+roc_curve <- roc(y_test_log, as.numeric(pred_prob))
+plot(roc_curve, col="blue", lwd=2)
+auc(roc_curve)
+```
+
+# Introduction
+This report investigates the factors that drive economic performance across countries. Our research question concerns whether economic and demographic indicators can be used to predict GDP growth, both by explaining variation in the continuous growth rate and by identifying the most relevant predictors. This question is important for policy and decision-making, since governments planning to increase spending often rely on borrowing, which requires sufficient future growth to ensure repayment. Understanding which conditions are associated with stronger growth therefore provides valuable insights for policymakers, international institutions, and investors.
+
+# Data 
+The data were obtained from the World Bank’s Jobs Indicators Database and Balance of Payments (BoP) statistics, which provide internationally comparable measures of economic and demographic conditions. The dataset covers 150 countries and includes 74 variables that capture a broad range of characteristics. These include demographic indicators such as fertility rates, life expectancy, and age dependency ratios; economic variables such as GDP per capita, net trade, and population growth; employment-related indicators such as sectoral employment shares and unemployment rates; and infrastructure or institutional measures such as access to electricity, internet usage, and credit registry coverage.
+The outcome of interest is GDP growth (annual %), which measures the year-on-year percentage change in a country’s gross domestic product. This indicator reflects how fast an economy is expanding or contracting and is a central measure of economic performance. In this report it serves as the dependent variable and is primarily analysed in its continuous form, allowing us to study how variation in demographic, economic, employment, and institutional factors is associated with differences in growth rates across countries. In one part of the analysis, GDP growth is also recoded into a binary measure using a 2.7 percent benchmark to distinguish higher- from lower-growth countries, but the main focus remains on the continuous specification.
+
+
+# Methodology 
+
+**Data Cleaning**\newline
+The dataset initially contained 74 variables, many of which had long names with special characters such as % which was replaced with "." by using the function names() to replace these characters. The dependent variable was renamed to gdp_annual_growth, and an important independent variable of interest was renamed to net_trade_bop_usd for clarity and ease of reference. Additional cleaning steps included data type conversion for relevant variables to numeric, and the Country variable to a factor; and lastly, missing data or NA values were omitted. After cleaning, the dataset consisted of 150 countries with 74 numeric predictors.
+
+**Model 1: OLS with Stepwise Backward Selection**\newline
+We began with a multiple linear regression (OLS) framework to model the relationship between GDP growth and the set of significant predictors from the dataset. The general form of the model is:
+$$\text{GDP Growth Annual}_{i} = \beta_0 + \beta_1 X_{1i} + \beta_2 X_{2i} + \cdots + \beta_k X_{ki} + \epsilon_i$$
+To identify the most significant predictors, we employed stepwise backward selection using the AIC. The process iteratively removes the least significant variable at each step until the optimal model is reached. To further improve prediction we created a nonlinear term: squared term for fertility rate (fertility_sq) which would capture potential nonlinear effects of population dynamics. This extended the regression model as follows:
+
+$$\text{GDP Growth Annual}_{i} = \beta_0 + \beta_1 \cdot \text{Fertility}_{i}^2 + \beta_2 \cdot \text{Net Trade}_{i} + \sum_{j=3}^{m} \beta_j X_{sel,j,i} + \epsilon_i$$
+Including this nonlinear term helped improve model fit by allowing for curvature in the relationship between fertility and GDP growth.
+
+**Model 2: LASSO Regression**\newline
+OLS can perform well in small, clean datasets but becomes unstable and unreliable with high-dimensional or highly correlated predictors, which was the case in our variables in the dataset. Common issues with OLS include overfitting due to too many predictors relative to the sample size, multicollinearity leading to inflated standard errors and unreliable coefficient estimates. Additionally, omitted variable bias is casued by arbitrarily removing variables to fix multicollinearity resulting to biased estimates. To address these limitations, we implemented LASSO (Least Absolute Shrinkage and Selection Operator) regression, which performs automatic variable selection and regularization in a single step. 
+
+$$\min_{\beta} \left\{ \frac{1}{2n} \sum_{i=1}^{n} \left( y_i - \beta_0 - \sum_{j=1}^{p} \beta_j x_{ij} \right)^2 + \lambda \sum_{j=1}^{p} |\beta_j| \right\}$$
+Where:\newline
+$λ$: is the penalty parameter controlling the amount of shrinkage.\newline
+Larger $λ$: forces more coefficients toward zero, effectively performing variable selection.\newline
+However, we used the same variables identified in the OLS model in order to observe which coefficients were shrunk to zero by LASSO and compare predictive performance against the OLS model.
+
+In order to evaluate out-of-sample performance, we split data into a training set with 110 observations and a test set with 40 observations. Additionally, 10-fold cross-validation was applied to tune the optimal penalty parameter $λ$. This process ensures that the model generalizes well to unseen data and avoids overfitting.
+
+**Model 3: Ridge and Elastic Net Regression**\newline
+We further extended the analysis using Ridge regression and Elastic Net, both of which are regularization techniques designed to handle high-dimensional datasets.
+Ridge Regression: Adds an L2 penalty term that shrinks coefficients closer to zero but does not set them exactly to zero:
+$$\min_{\beta} \left\{ \frac{1}{2n} \sum_{i=1}^{n} \left( y_i - \beta_0 - \sum_{j=1}^{p} \beta_j x_{ij} \right)^2 + \lambda \sum_{j=1}^{p} \beta_j^2 \right\}$$
+Elastic Net: Combines both L1 (LASSO) and L2 (Ridge) penalties:
+$$\min_{\beta} \left\{ \frac{1}{2n} \sum_{i=1}^{n} \left( y_i - \beta_0 - \sum_{j=1}^{p} \beta_j x_{ij} \right)^2 
++ \lambda \left[ \alpha \sum_{j=1}^{p} |\beta_j| + (1-\alpha) \sum_{j=1}^{p} \beta_j^2 \right] \right\}$$
+Where:\newline
+Gamma ($α$) controls the mix between LASSO and Ridge (0 = pure Ridge, 1 = pure LASSO).
+
+**Models with Lambda Selection: $λ$.min vs $λ$.1se**\newline
+The cv.glmnet() function was used to determine two key lambda values:\newline
+$λ$.min: The penalty value that produces the lowest cross-validation error. This is referred to as the best lambda due to the lowest MSE. However, this leads to an overfitted predictive model. \newline
+$λ$.1se: The largest $λ$ within one standard error of the minimum error. Produces a simpler, more regularized model, which is less prone to overfitting and hence easier to interpret.
+
+*Evaluation Metrics*To compare models, we used both regression and classification performance metrics:\newline
+Regression Metrics:\newline
+- Root Mean Squared Error (RMSE):\newline
+Classification Metrics (for Logistic Ridge Regression):\newline
+- Accuracy: shows the proportion of correctly classified observations.\newline
+- Confusion Matrix: Breakdown of true vs. predicted classifications.\newline
+- Area Under the Curve (AUC): Measures the model’s ability to discriminate between classes.\newline
+- ROC Curves: Visualization of classification performance across thresholds.
+
+# Results
+Our initial attempt at a standard linear regression encountered perfect multicollinearity, meaning some explanatory variables were exact combinations of others, preventing the model from estimating unique coefficients. To address this, we removed redundant variables while still capturing the sectoral structure of the economy and retained Net Trade in goods and services (BoP, US$). This regression ran successfully but yielded a very low R² of 3.87, indicating almost no variation in GDP growth was explained. To improve performance, we applied stepwise regression, which systematically selects variables contributing meaningfully to explaining GDP growth while balancing model complexity and fit. Including Net Trade in the regression did not improve the overall fit, suggesting that trade balances, while theoretically important, added little predictive power beyond other correlated indicators. The baseline regression explained a meaningful but incomplete share of growth dynamics, achieving an adjusted R² of 0.44 and a residual standard error of 3.3.We tested for nonlinear fertility effects by including a squared fertility term, motivated by the hypothesis that very low fertility can limit labor supply, very high fertility can strain resources, and moderate fertility may be most favorable for growth. The adjusted R² barely changed (0.4385 vs. 0.439), and the residual standard error remained virtually identical (3.327), indicating this nonlinear term did not provide additional explanatory value.
+
+Recognizing the limitations of OLS, we next applied LASSO regression. This stabilized coefficient estimates by shrinking less important predictors toward zero. Standardizing predictors was essential, as variables measured on different scales would otherwise be unfairly weighted. Standardization altered which predictors were selected, highlighting its effect on interpretability and variable retention. Compared to OLS, LASSO provided a clearer view of the variables most strongly associated with GDP growth. We extended the penalized approach using ridge and elastic net regression. Cross-validation selected optimal penalty parameters, and the best elastic net solution converged to $α$ $≈$ 0, effectively reducing to ridge regression. Both methods produced nearly identical results: RMSE $≈$ 3.98 and R² $≈$ 0.19 on the training set, and RMSE $≈$ 2.54 on the test set. These models predict GDP growth with an error margin of 2.5–4.5 percentage points. While explanatory power is modest, the models consistently identified relevant predictors: labour market indicators (employment shares and unemployment, negatively associated), trade performance (export value and volume, positive), and business environment measures (credit depth positive; time to start a business and pay taxes negative). Elastic Net with $λ$ 1se highlighted fewer, stronger predictors, producing a parsimonious model, whereas ridge regression distributed influence across many variables, retaining all with small but nonzero weights.
+```{r, echo = FALSE, eval = TRUE, warning=FALSE}
+compare_results <- data.frame(
+  Model = c("Ridge $λ$.min", "Ridge$λ$.1se", "ElasticNet$λ$.min", "ElasticNet$λ$.1se"),
+  lambda = c(r_cv$lambda.min, r_cv$lambda.1se, en_cv$lambda.min, en_cv$lambda.1se), 
+  alpha = c(0, 0, best_alpha, best_alpha),
+  RMSE  = c(rmse(y_test, r_min_pred), rmse(y_test, ridge_1se_pred), 
+            rmse(y_test, en_min_pred), rmse(y_test, en_1se_pred)))
+  knitr::kable(compare_results, caption = "Performance Comparison")
+```
+To complement these regressions, we recast the task as a binary classification, defining countries as “high-growth” if GDP growth exceeded 2.7%. Ridge logistic regression with $λ$ min achieved 62.5% accuracy and AUC 0.81, correctly identifying most high-growth countries but showing lower specificity. In contrast, $λ$ 1se performed worse, with accuracy dropping to 47.5% and AUC of 0.5, effectively random. Using a smaller training set further reduced predictive performance ($~$ 45% accuracy), demonstrating the importance of sufficient data. Taken together, ridge regression with $λ$ min provides the most reliable predictions of GDP growth. While explanatory power is modest, it avoids OLS pitfalls such as multicollinearity and overfitting. Expanding the dataset by adding more countries (rows) would likely improve predictive reliability, whereas adding more variables risks redundancy. Predicting continuous GDP growth is valuable for economic planning, market analysis, and investment outlooks, while the binary “Growing More” classification is more actionable for policy targeting, as it identifies countries likely to achieve sustained growth above a key threshold.
+
+# Conclusion and Discussion
+In our analysis we considered various economic, demographic and developmental factors of countries with the aim of predicting GDP growth across countries. The methods we used to investigate this were multiple linear regression and penalized regression techniques. Across all models, the ridge regression with $λ$ 1SE consistently was the most reliable model for prediction. While the different models all had moderate results when it comes to explanatory power, the ridge regression was able to mitigate the multicollinearity as well as the overfitting issues the OLS regression models faced. As a result, the ridge regression provided us with a more stable and interpretable set of predictor variables. Moreover, elastic net produced very similar results, as the optimal solution for the hyper parameter converged to a ridge regression with ($α$ $≈$ 0). This shows that combining the lasso with the ridge penalties did not offer any additional advantage for interpreting our dataset. The stepwise OLS regression only captured part of the variation in GDP growth, with the addition of the nonlinear squared fertility term not aiding in that. 
+\newline
+The penalized methods more clearly defined the key drivers of growth and thereby allowed us to answer our research question, namely: labor market indicators (employment shares and unemployment, negatively associated), trade performance (export value and volume, positive), and business environment measures (credit depth positive; time to start a business and pay taxes negative). Additionally, using ridge logistic regression to predict either high or low growth in GDP for countries had a reasonable accuracy (62.5%) and good discrimination (AUC = 0.81), though the $λ$ 1SE model performed poorly due to oversimplification. Predicting continuous GDP growth is valuable for economic planning, market analysis and investment decisions,  while the binary classification for growing ‘more’ or ‘less’ is more relevant for policy making as it allows governments to identify if they are meeting economic targets or if their economies demand closer attention. In this research there were some limitations, as there might be omitted variable bias, potential nonlinear interactions that were not captured in our models and the data is only cross-sectional. In future research longitudinal data could be included to help capture growth dynamics over time and non-linear research methods could be utilized. In conclusion, the predictors mentioned above influence GDP growth as shown by penalized regression methods, specifically ridge regression. Overall ridge regression is a robust and interpretable method for predicting GDP growth in high-dimensional datasets.
+
+\newpage
+# Appendix
+```{r, warning = FALSE, echo = TRUE, eval = FALSE}
+#stepwise backward selection 
+base_model <- lm(gdp_growth_annual ~ . - Country, data = df)
+step_model <- stepAIC(base_model, direction = "backward")
+final_formula <- update(formula(step_model), . ~ . + net_trade_bop_usd)
+
+#OLS MODEL 
+reg_final <- lm(final_formula, data = df, singular.ok = FALSE)
+
+#NON-LINEAR VARIABLE MODEL: Squared fertility
+df <- df %>% mutate(fertility_sq = Fertility.rate..total..births.per.woman.^2)
+nonlinear_formula <- update(formula(step_model), . ~ . + fertility_sq +
+                              net_trade_bop_usd) 
+reg_nonlinear <- lm(nonlinear_formula, data = df, singular.ok = FALSE) #Fit the model
+
+#LASSO MODEL with same vars as OLS model 
+X <- model.matrix(nonlinear_formula, data = df)[, -1]
+y <- df$gdp_growth_annual
+
+set.seed(100) #set seed for consistent results
+lasso_cv <- cv.glmnet(X, y, alpha = 1, maxit = 1e6)
+coef(lasso_cv, s = "lambda.min")
+
+#TESTING AND TRAINING SPLIT
+set.seed(100)
+train_idx <- sample(1:nrow(df), 110)
+train_df <- df[train_idx, ]
+test_df <- df[-train_idx, ]
+
+X_train <- model.matrix(gdp_growth_annual ~ . - Country - fertility_sq, data = train_df)[, -1]
+y_train <- train_df$gdp_growth_annual
+X_test  <- model.matrix(gdp_growth_annual ~ . - Country - fertility_sq, data = test_df)[, -1]
+y_test  <- test_df$gdp_growth_annual
+
+#CROSS VALIDATION
+fitControl <- trainControl(method="repeatedcv", number=10, repeats=5)
+
+#RIDGE REG MODEL
+ridge_model <- train(x=X_train, y=y_train, method="glmnet",
+  tuneGrid=expand.grid(alpha=0, lambda=seq(0.0001, 1000, length=100)),
+  trControl=fitControl, preProcess=c("center", "scale"))
+
+#ELASTIC NET REG MODEL
+elastic_model <- train(x=X_train, y=y_train,method="glmnet",
+  tuneGrid=expand.grid(alpha=seq(0,1,length=10), lambda=seq(0.0001, 1000, length=50)),
+  trControl=fitControl, preProcess=c("center", "scale"))
+
+#RESULT COMPARISION: RMSE
+res <- resamples(list(Ridge=ridge_model, ElasticNet=elastic_model))
+
+#Ridge using cv.glmnet to get lambda.min and lambda.1se
+set.seed(100)
+r_cv <- cv.glmnet(x = X_train, y = y_train, alpha = 0, #Ridge
+  lambda = 10^seq(-3, 5, length.out = 100),  #Search over a wide range of lambdas
+  nfolds = 10) #10-fold cross-validation
+
+r_min_model <- glmnet(X_train, y_train, alpha = 0, lambda = r_cv$lambda.min)#Fit Ridge at lambda.min
+r_1se_model <- glmnet(X_train, y_train, alpha = 0, lambda = r_cv$lambda.1se)#Fit Ridge at lambda.1se
+
+best_alpha <- elastic_model$bestTune$alpha #best alpha from caret Elastic Net model
+
+#Elastic Net using cv.glmnet with optimal alpha
+set.seed(100)
+en_cv <- cv.glmnet(x = X_train,y = y_train, alpha = best_alpha,# Optimal mix between Lasso and Ridge
+  lambda = 10^seq(-3, 5, length.out = 100),nfolds = 10)
+
+#Fit Elastic Net at lambda.min and lambda.1se
+en_min_model <- glmnet(X_train, y_train, alpha = best_alpha, lambda = en_cv$lambda.min) #Fit EN at lambda.min
+en_1se_model <- glmnet(X_train, y_train, alpha = best_alpha, lambda = en_cv$lambda.1se)#Fit EN at lambda.min
+
+#Predictions and Performance
+r_min_pred <- predict(r_min_model, newx = X_test) # Ridge $λ$min
+ridge_1se_pred <- predict(r_1se_model, newx = X_test) # Ridge $λ$1se
+en_min_pred <- predict(en_min_model, newx = X_test) # Elastic Net $λ$min
+en_1se_pred <- predict(en_1se_model, newx = X_test) # Elastic Net $λ$1se
+
+compare_results <- data.frame( #table
+  Model = c("Ridge $λ$.min", "Ridge .1se", "ElasticNet $λ$.min", "ElasticNet $λ$.1se"),
+  lambda = c(r_cv$lambda.min, r_cv$lambda.1se, en_cv$lambda.min, en_cv$lambda.1se), 
+  alpha = c(0, 0, best_alpha, best_alpha),
+  RMSE  = c(rmse(y_test, r_min_pred), rmse(y_test, ridge_1se_pred), rmse(y_test, en_min_pred), rmse(y_test, en_1se_pred)))
+
+#Logistic Model: dependent variable
+df <- df %>% mutate(growing_more = factor(ifelse(gdp_growth_annual > 2.7, 1, 0)))
+
+set.seed(1) # Train-test split USING LOG MODEL 
+log_train_idx <- sample(1:nrow(df), 110)
+train_log <- df[log_train_idx, ]
+test_log  <- df[-log_train_idx, ]
+
+x_train_log <- model.matrix(growing_more ~ . - Country - gdp_growth_annual, 
+                            data = train_log)[, -1]
+y_train_log <- train_log$growing_more
+x_test_log  <- model.matrix(growing_more ~ . - Country - gdp_growth_annual, 
+                            data = test_log)[, -1]
+y_test_log  <- test_log$growing_more
+cv_ridge_log <- cv.glmnet(x_train_log, y_train_log, family="binomial", alpha=0, nfolds=10)
+
+# ROC & AUC
+pred_prob <- predict(cv_ridge_log, newx=x_test_log, s="lambda.min", type="response")
+roc_curve <- roc(y_test_log, as.numeric(pred_prob))
+plot(roc_curve, col="blue", lwd=2)
+auc(roc_curve)
+```
+
+Results from Ridge and Elastic Net Models 
+```{r, echo = FALSE, eval = TRUE, warning=FALSE}
+#RESULT COMPARISION: RMSE
+res <- resamples(list(Ridge=ridge_model, ElasticNet=elastic_model))
+summary(res)
+#full coefficients 
+# Ridge coefficients
+ridge_coefs <- as.matrix(coef(ridge_model$finalModel, s = ridge_model$bestTune$lambda))
+ridge_df <- data.frame(Variable = rownames(ridge_coefs), Coefficient_EN = ridge_coefs[,1])[-1]
+
+# Elastic Net coefficients
+en_coefs <- as.matrix(coef(elastic_model$finalModel, s = elastic_model$bestTune$lambda))
+en_df <- data.frame(Variable = rownames(en_coefs), Coefficient_R = en_coefs[,1])[-1]
+df_f <- cbind.data.frame(ridge_df, en_df)
+knitr::kable(df_f, caption = "Ridge and Elastic Net Coefficients")
+```
+
+
