@@ -23,5 +23,4 @@ This project predicts GDP growth across countries using multiple linear regressi
 
 ## Notes
 - This was a group assignment completed in class  
-- Data files are included in `data`  
 - Scripts are modular for clarity and reproducibility
