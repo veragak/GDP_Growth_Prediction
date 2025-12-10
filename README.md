@@ -8,7 +8,7 @@
 This project predicts GDP growth across countries using multiple linear regression and penalized regression techniques (LASSO, Ridge, Elastic Net) with R. It explores key economic, demographic, and institutional factors to identify drivers of growth. Both continuous and binary (high-growth) outcomes are analyzed.
 
 ## Folder Structure
-- `data` – Original dataset used for analysis  
+- `data` – The dataset used in this project cannot be shared due to course policies.
 - `scripts` – R scripts separated by analysis steps  
 - `report` – RMarkdown file and generated PDF report  
 - `output` – Graphs and model outputs (optional for upload)  
